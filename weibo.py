@@ -43,7 +43,7 @@ class Weibo(object):
     def __init__(self, config):
         """Weibo类初始化"""
         self.validate_config(config)
-        self.filter = config["filter"]  # 取值范围为0、1,程序默认值为0,代表要爬取用户的全部微博,1代表只爬取用户的原创微博
+        self.only_crawl_original = config["only_crawl_original"]  # 取值范围为0、1,程序默认值为0,代表要爬取用户的全部微博,1代表只爬取用户的原创微博
         self.remove_html_tag = config[
             "remove_html_tag"
         ]  # 取值范围为0、1, 0代表不移除微博中的html tag, 1代表移除
@@ -76,8 +76,8 @@ class Weibo(object):
         self.repost_max_download_count = config[
             "repost_max_download_count"
         ]  # 如果设置了下转发，每条微博转发数会限制在这个值内
-        self.result_dir_name = config.get(
-            "result_dir_name", 0
+        self.user_id_as_folder_name = config.get(
+            "user_id_as_folder_name", 0
         )  # 结果目录名，取值为0或1，决定结果文件存储在用户昵称文件夹里还是用户id文件夹里
         cookie = config.get("cookie")  # 微博cookie，可填可不填
         user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/86.0.4240.111 Safari/537.36"
@@ -85,6 +85,8 @@ class Weibo(object):
         self.mysql_config = config.get("mysql_config")  # MySQL数据库连接配置，可以不填
         self.mongodb_URI = config.get("mongodb_URI")  # MongoDB数据库连接字符串，可以不填
         user_id_list = config["user_id_list"]
+        # 避免卡住
+        random.shuffle(user_id_list)
         query_list = config.get("query_list") or []
         if isinstance(query_list, str):
             query_list = query_list.split(",")
@@ -114,13 +116,14 @@ class Weibo(object):
         self.got_count = 0  # 存储爬取到的微博数
         self.weibo = []  # 存储爬取到的所有微博信息
         self.weibo_id_list = []  # 存储爬取到的所有微博id
+        self.long_sleep_count_before_each_user = 0 #每个用户前的长时间sleep避免被ban
 
     def validate_config(self, config):
         """验证配置是否正确"""
 
-        # 验证filter、original_pic_download、retweet_pic_download、original_video_download、retweet_video_download
+        # 验证如下1/0相关值
         argument_list = [
-            "filter",
+            "only_crawl_original",
             "original_pic_download",
             "retweet_pic_download",
             "original_video_download",
@@ -329,8 +332,17 @@ class Weibo(object):
     def get_user_info(self):
         """获取用户信息"""
         params = {"containerid": "100505" + str(self.user_config["user_id"])}
-        # TODO 这里在读取下一个用户的时候很容易被ban，需要优化休眠时长
-        sleep(random.randint(60, 180))
+
+        # 这里在读取下一个用户的时候很容易被ban，需要优化休眠时长
+        # 加一个count，不需要一上来啥都没干就sleep
+        if self.long_sleep_count_before_each_user > 0:
+            sleep_time = random.randint(30, 60)
+            # 添加log，否则一般用户不知道以为程序卡了
+            logger.info(f"""短暂sleep {sleep_time}秒，避免被ban""")        
+            sleep(sleep_time)
+            logger.info("sleep结束")  
+        self.long_sleep_count_before_each_user = self.long_sleep_count_before_each_user + 1      
+
         js, status_code = self.get_json(params)
         if status_code != 200:
             logger.info("被ban了，需要等待一段时间")
@@ -467,40 +479,48 @@ class Weibo(object):
         try:
 
             file_exist = os.path.isfile(file_path)
-            sqlite_exist = ("sqlite" in self.write_mode) and (
-                self.sqlite_exist_file(file_path)
-            )
+            need_download = (not file_exist)
+            sqlite_exist = False
+            if "sqlite" in self.write_mode:
+                sqlite_exist = self.sqlite_exist_file(file_path)
+                if not sqlite_exist: 
+                    need_download = True
 
-            need_download = (not file_exist) or (not sqlite_exist)
-            if need_download:
-                s = requests.Session()
-                s.mount(url, HTTPAdapter(max_retries=5))
-                flag = True
-                try_count = 0
-                while flag and try_count < 5:
-                    flag = False
-                    downloaded = s.get(
-                        url, headers=self.headers, timeout=(5, 10), verify=False
-                    )
-                    try_count += 1
-                    if (
-                        url.endswith(("jpg", "jpeg"))
-                        and not downloaded.content.endswith(b"\xff\xd9")
-                    ) or (
-                        url.endswith("png")
-                        and not downloaded.content.endswith(b"\xaeB`\x82")
-                    ):
-                        flag = True
+            if not need_download:
+                return 
 
+            s = requests.Session()
+            s.mount(url, HTTPAdapter(max_retries=5))
+            try_count = 0
+            success = False
+            MAX_TRY_COUNT = 3
+            while try_count < MAX_TRY_COUNT:
+                downloaded = s.get(
+                    url, headers=self.headers, timeout=(5, 10), verify=False
+                )
+                try_count += 1
+                fail_flg_1 = url.endswith(("jpg", "jpeg")) and not downloaded.content.endswith(b"\xff\xd9")
+                fail_flg_2 = url.endswith("png") and not downloaded.content.endswith(b"\xaeB`\x82")
+
+                if ( fail_flg_1  or fail_flg_2):
+                    logger.debug("[DEBUG] failed " + url + "  " + str(try_count))
+                else:
+                    success = True
+                    logger.debug("[DEBUG] success " + url + "  " + str(try_count))
+                    break
+
+            if success: 
                 # 需要分别判断是否需要下载
                 if not file_exist:
                     with open(file_path, "wb") as f:
                         f.write(downloaded.content)
-
+                        logger.debug("[DEBUG] save " + file_path )
                 if (not sqlite_exist) and ("sqlite" in self.write_mode):
                     self.insert_file_sqlite(
                         file_path, weibo_id, url, downloaded.content
                     )
+            else:
+                logger.debug("[DEBUG] failed " + url + " TOTALLY")
         except Exception as e:
             error_file = self.get_filepath(type) + os.sep + "not_downloaded.txt"
             with open(error_file, "ab") as f:
@@ -1073,7 +1093,11 @@ class Weibo(object):
                 # 如果需要检查cookie，在循环第一个人的时候，就要看看仅自己可见的信息有没有，要是没有直接报错
                 for w in weibos:
                     if w["card_type"] == 11:
-                        w = w.get("card_group",[0])[0] or w
+                        temp = w.get("card_group",[0])
+                        if len(temp) >= 1:
+                            w = temp[0] or w
+                        else:
+                            w = w
                     if w["card_type"] == 9:
                         wb = self.get_one_weibo(w)
                         if wb:
@@ -1161,7 +1185,7 @@ class Weibo(object):
                                         )
                                     )
                                     return True
-                            if (not self.filter) or ("retweet" not in wb.keys()):
+                            if (not self.only_crawl_original) or ("retweet" not in wb.keys()):
                                 self.weibo.append(wb)
                                 self.weibo_id_list.append(wb["id"])
                                 self.got_count += 1
@@ -1222,7 +1246,7 @@ class Weibo(object):
                     if k == "id":
                         v = str(v) + "\t"
                     wb[k] = v
-            if not self.filter:
+            if not self.only_crawl_original:
                 if w.get("retweet"):
                     wb["is_original"] = False
                     for k2, v2 in w["retweet"].items():
@@ -1240,7 +1264,7 @@ class Weibo(object):
         """获取结果文件路径"""
         try:
             dir_name = self.user["screen_name"]
-            if self.result_dir_name:
+            if self.user_id_as_folder_name:
                 dir_name = self.user_config["user_id"]
             file_dir = (
                 os.path.split(os.path.realpath(__file__))[0]
@@ -1278,7 +1302,7 @@ class Weibo(object):
             "话题",
             "@用户",
         ]
-        if not self.filter:
+        if not self.only_crawl_original:
             result_headers2 = ["是否原创", "源用户id", "源用户昵称"]
             result_headers3 = ["源微博" + r for r in result_headers]
             result_headers = result_headers + result_headers2 + result_headers3
@@ -1846,7 +1870,7 @@ class Weibo(object):
                 self.download_files("img", "original", wrote_count)
             if self.original_video_download:
                 self.download_files("video", "original", wrote_count)
-            if not self.filter:
+            if not self.only_crawl_original:
                 if self.retweet_pic_download:
                     self.download_files("img", "retweet", wrote_count)
                 if self.retweet_video_download:
@@ -1955,6 +1979,11 @@ class Weibo(object):
             logger.exception(e)
 
 
+def handle_config_renaming(config, oldName, newName):
+    if oldName in config and newName not in config:
+        config[newName] = config[oldName]
+        del config[oldName]
+
 def get_config():
     """获取config.json文件信息"""
     config_path = os.path.split(os.path.realpath(__file__))[0] + os.sep + "config.json"
@@ -1967,6 +1996,9 @@ def get_config():
     try:
         with open(config_path, encoding="utf-8") as f:
             config = json.loads(f.read())
+            # 重命名一些key, 但向前兼容
+            handle_config_renaming(config, oldName="filter", newName="only_crawl_original")
+            handle_config_renaming(config, oldName="result_dir_name", newName="user_id_as_folder_name")
             return config
     except ValueError:
         logger.error(
